@@ -917,22 +917,23 @@ void *scanner_worker(void *arg)
   remote_addr.sin_family = AF_INET;
   remote_addr.sin_port = htons(o.port);
 
-  for (int batch_start = job->start; batch_start < job->end; batch_start += o.batch_size) {
-    int batch_end = batch_start + o.batch_size;
-    if (batch_end > job->end) {
-      batch_end = job->end;
+  for (c = 0; c < community_count; c++) {
+    if (o.debug > 0) {
+      logr("Trying community %s\n", community[c]);
     }
+    sendbuf_size = build_snmp_req((char*)&sendbuf, sizeof(sendbuf), community[c]);
 
-    if (o.debug > 1) {
-      logr("Job starting batch from host %d to %d\n", batch_start, batch_end);
-    }
-
-    // Send phase for the batch
-    for (c = 0; c < community_count; c++) {
-      if (o.debug > 0) {
-        logr("Trying community %s\n", community[c]);
+    for (int batch_start = job->start; batch_start < job->end; batch_start += o.batch_size) {
+      int batch_end = batch_start + o.batch_size;
+      if (batch_end > job->end) {
+        batch_end = job->end;
       }
-      sendbuf_size = build_snmp_req((char*)&sendbuf, sizeof(sendbuf), community[c]);
+
+      if (o.debug > 1) {
+        logr("Job starting batch from host %d to %d for community %s\n", batch_start, batch_end, community[c]);
+      }
+
+      // Send phase for the batch
       for (i = batch_start; i < batch_end; i++) {
         remote_addr.sin_addr.s_addr = host[i].addr;
         if (o.debug > 1) {
@@ -946,50 +947,50 @@ void *scanner_worker(void *arg)
         }
         usleep(o.wait * 1000);
       }
-    }
 
-    // Receive phase for the batch
-    gettimeofday(&tv_now, NULL);
-    tv_until.tv_sec = tv_now.tv_sec + o.timeout;
-    tv_until.tv_usec = tv_now.tv_usec;
-
-    do {
-      FD_ZERO(&fds);
-      FD_SET(sock, &fds);
-
+      // Receive phase for the batch
       gettimeofday(&tv_now, NULL);
-      if(timeval_subtract(&tv_wait, &tv_until, &tv_now)) {
-        break;
-      }
+      tv_until.tv_sec = tv_now.tv_sec + o.timeout;
+      tv_until.tv_usec = tv_now.tv_usec;
 
-      if ((ret = select(sock + 1, &fds, NULL, NULL, &tv_wait)) == -1) {
-        logr("Error in pselect\n");
-        exit(1);
-      } else if (ret > 0) {
-        memset(&recv_buf, 0x0, sizeof(recv_buf));
-        remote_addr_len = sizeof(remote_addr);
-        ret = recvfrom(sock, &recv_buf, sizeof(recv_buf), 0, (struct sockaddr*)&remote_addr, &remote_addr_len);
-        if (ret < 0) {
-          if (errno == ECONNRESET) {
-            logr("%s ICMP unreach received\n", inet_ntoa(remote_addr.sin_addr));
+      do {
+        FD_ZERO(&fds);
+        FD_SET(sock, &fds);
+
+        gettimeofday(&tv_now, NULL);
+        if(timeval_subtract(&tv_wait, &tv_until, &tv_now)) {
+          break;
+        }
+
+        if ((ret = select(sock + 1, &fds, NULL, NULL, &tv_wait)) == -1) {
+          logr("Error in pselect\n");
+          exit(1);
+        } else if (ret > 0) {
+          memset(&recv_buf, 0x0, sizeof(recv_buf));
+          remote_addr_len = sizeof(remote_addr);
+          ret = recvfrom(sock, &recv_buf, sizeof(recv_buf), 0, (struct sockaddr*)&remote_addr, &remote_addr_len);
+          if (ret < 0) {
+            if (errno == ECONNRESET) {
+              logr("%s ICMP unreach received\n", inet_ntoa(remote_addr.sin_addr));
+            } else {
+              logr("Error in recvfrom\n");
+            }
           } else {
-            logr("Error in recvfrom\n");
-          }
-        } else {
-          logr("%s ", inet_ntoa(remote_addr.sin_addr));
-          parse_snmp_response((u_char*)&recv_buf, ret);
-          if (o.print_ip) {
-            int quiet = o.quiet;
-            o.quiet = 0;
-            logr("%s\n", inet_ntoa(remote_addr.sin_addr));
-            o.quiet = quiet;
-          }
-          if (o.log) {
-            fflush(o.log_fd);
+            logr("%s ", inet_ntoa(remote_addr.sin_addr));
+            parse_snmp_response((u_char*)&recv_buf, ret);
+            if (o.print_ip) {
+              int quiet = o.quiet;
+              o.quiet = 0;
+              logr("%s\n", inet_ntoa(remote_addr.sin_addr));
+              o.quiet = quiet;
+            }
+            if (o.log) {
+              fflush(o.log_fd);
+            }
           }
         }
-      }
-    } while(1);
+      } while(1);
+    }
   }
 
   close(sock);
