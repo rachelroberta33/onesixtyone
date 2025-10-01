@@ -68,6 +68,8 @@ struct {
   int quiet;
   long wait;
   int jobs;
+  int batch_size;
+  int timeout;
   FILE* log_fd;
 } o;
 
@@ -92,6 +94,8 @@ void usage()
   printf("  -c <communityfile> file with community names to try\n");
   printf("  -i <inputfile>     file with target hosts\n");
   printf("  -j <jobs>          number of parallel jobs (default 1)\n");
+  printf("  -b <batch_size>    batch size for each job (default 250)\n");
+  printf("  -t <timeout>       timeout in seconds for each batch (default 10)\n");
   printf("  -o <outputfile>    output log\n");
   printf("  -p                 specify an alternate destination SNMP port\n");
   printf("  -d                 debug mode, use twice for more information\n\n");
@@ -280,13 +284,23 @@ void init_options(int argc, char *argv[])
   o.quiet = 0;
   o.wait = 10;
   o.jobs = 1;
+  o.batch_size = 250;
+  o.timeout = 10;
   input_file = 0;
   community_file = 0;
 
   o.log_fd = NULL;
 
-  while ((arg = getopt(argc, argv, "c:di:j:o:p:s:w:q")) != EOF) {
+  while ((arg = getopt(argc, argv, "b:c:di:j:o:p:s:t:w:q")) != EOF) {
     switch (arg) {
+    case 'b':
+      if (strtol(optarg, NULL, 10) == 0) {
+        printf("Malformed batch size: %s\n", optarg);
+        exit(1);
+      } else {
+        o.batch_size = strtol(optarg, NULL, 10);
+      }
+      break;
     case 'c':	community_file = 1;
       strncpy(community_filename, optarg, sizeof(community_filename));
       break;
@@ -296,6 +310,14 @@ void init_options(int argc, char *argv[])
         exit(1);
       } else {
         o.jobs = strtol(optarg, NULL, 10);
+      }
+      break;
+    case 't':
+      if (strtol(optarg, NULL, 10) == 0) {
+        printf("Malformed timeout: %s\n", optarg);
+        exit(1);
+      } else {
+        o.timeout = strtol(optarg, NULL, 10);
       }
       break;
     case 'd':	o.debug++;
@@ -857,161 +879,156 @@ void parse_snmp_response(u_char* buf, int buf_size)
   logr("\n");
 }
 
-struct sender_job {
-  int sock;
+struct scanner_job {
   int start;
   int end;
 };
 
-void *sender_worker(void *arg)
+void *scanner_worker(void *arg)
 {
-  struct sender_job *job = arg;
+  struct scanner_job *job = arg;
   struct sockaddr_in remote_addr;
   int c, i, ret, sendbuf_size;
   char sendbuf[1500];
 
-  remote_addr.sin_family = AF_INET;
-  remote_addr.sin_port = htons(o.port);
-
-  for (c = 0; c < community_count; c++) {
-    if (o.debug > 0) {
-      logr("Trying community %s\n", community[c]);
-    }
-    sendbuf_size = build_snmp_req((char*)&sendbuf, sizeof(sendbuf), community[c]);
-    for (i = job->start; i < job->end; i++) {
-      remote_addr.sin_addr.s_addr = host[i].addr;
-      if (o.debug > 1) {
-        logr("Sending to ip %s\n", inet_ntoa(*(struct in_addr*)&remote_addr.sin_addr.s_addr));
-      }
-      ret = sendto(job->sock, &sendbuf, sendbuf_size, 0, (struct sockaddr*)&remote_addr, sizeof(remote_addr));
-      if (ret < 0) {
-        if (!o.quiet) {
-          logr("Error in sendto: %s\n", strerror(errno));
-        }
-      }
-      usleep(o.wait * 1000);
-    }
-  }
-
-  free(arg);
-  return NULL;
-}
-
-void timed_receive(int sock, long wait)
-{
   struct timeval tv_now, tv_until, tv_wait;
   unsigned int remote_addr_len;
-  char buf[1500];
-  int ret;
+  char recv_buf[1500];
   fd_set fds;
-  struct sockaddr_in remote_addr;
 
-  gettimeofday(&tv_now, NULL);
-  tv_until.tv_sec = tv_now.tv_sec;
-  tv_until.tv_usec = tv_now.tv_usec + wait * 1000;
-  if (tv_until.tv_usec >= 1000000) {
-    tv_until.tv_sec += tv_until.tv_usec / 1000000;
-    tv_until.tv_usec = tv_until.tv_usec % 1000000;
-  }
-
-  do {
-    FD_ZERO(&fds);
-    FD_SET(sock, &fds);
-
-    gettimeofday(&tv_now, NULL);
-    if(timeval_subtract(&tv_wait, &tv_until, &tv_now)) {
-      break;
-    }
-
-    if ((ret = select(sock + 1, &fds, NULL, NULL, &tv_wait)) == -1) {
-      logr("Error in pselect\n");
-      exit(1);
-    } else if (ret > 0) {
-      memset(&buf, 0x0, sizeof(buf));
-      remote_addr_len = sizeof(remote_addr);
-      ret = recvfrom(sock, &buf, sizeof(buf), 0, (struct sockaddr*)&remote_addr, &remote_addr_len);
-      if (ret < 0) {
-        if (errno == ECONNRESET) {
-          logr("%s ICMP unreach received\n", inet_ntoa(remote_addr.sin_addr));
-        } else {
-          logr("Error in recvfrom\n");
-        }
-      } else {
-        logr("%s ", inet_ntoa(remote_addr.sin_addr));
-        parse_snmp_response((u_char*)&buf, ret);
-        if (o.print_ip) {
-          int quiet = o.quiet;
-          o.quiet = 0;
-          logr("%s\n", inet_ntoa(remote_addr.sin_addr));
-          o.quiet = quiet;
-        }
-        if (o.log) {
-          fflush(o.log_fd);
-        }
-      }
-    }
-  } while(1);
-}
-
-int main(int argc, char* argv[])
-{
-  struct sockaddr_in local_addr;
-  int sock;
-  int ret;
-  int i;
-
-  init_options(argc, argv);
-  pthread_mutex_init(&log_mutex, NULL);
-
-  /* socket creation */
-  sock = socket(AF_INET, SOCK_DGRAM, 0);
+  int sock = socket(AF_INET, SOCK_DGRAM, 0);
   if (sock < 0) {
-    logr("Error creating socket\n");
-    exit(1);
+    logr("Error creating socket in thread\n");
+    return NULL;
   }
 
+  struct sockaddr_in local_addr;
   local_addr.sin_family = AF_INET;
   local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
   local_addr.sin_port = htons(0);
 
   ret = bind(sock, (struct sockaddr *)&local_addr, sizeof(local_addr));
   if (ret < 0) {
-    logr("Error binding socket\n");
-    exit(1);
+    logr("Error binding socket in thread\n");
+    close(sock);
+    return NULL;
   }
+
+  remote_addr.sin_family = AF_INET;
+  remote_addr.sin_port = htons(o.port);
+
+  for (int batch_start = job->start; batch_start < job->end; batch_start += o.batch_size) {
+    int batch_end = batch_start + o.batch_size;
+    if (batch_end > job->end) {
+      batch_end = job->end;
+    }
+
+    if (o.debug > 1) {
+      logr("Job starting batch from host %d to %d\n", batch_start, batch_end);
+    }
+
+    // Send phase for the batch
+    for (c = 0; c < community_count; c++) {
+      if (o.debug > 0) {
+        logr("Trying community %s\n", community[c]);
+      }
+      sendbuf_size = build_snmp_req((char*)&sendbuf, sizeof(sendbuf), community[c]);
+      for (i = batch_start; i < batch_end; i++) {
+        remote_addr.sin_addr.s_addr = host[i].addr;
+        if (o.debug > 1) {
+          logr("Sending to ip %s\n", inet_ntoa(*(struct in_addr*)&remote_addr.sin_addr.s_addr));
+        }
+        ret = sendto(sock, &sendbuf, sendbuf_size, 0, (struct sockaddr*)&remote_addr, sizeof(remote_addr));
+        if (ret < 0) {
+          if (!o.quiet) {
+            logr("Error in sendto: %s\n", strerror(errno));
+          }
+        }
+        usleep(o.wait * 1000);
+      }
+    }
+
+    // Receive phase for the batch
+    gettimeofday(&tv_now, NULL);
+    tv_until.tv_sec = tv_now.tv_sec + o.timeout;
+    tv_until.tv_usec = tv_now.tv_usec;
+
+    do {
+      FD_ZERO(&fds);
+      FD_SET(sock, &fds);
+
+      gettimeofday(&tv_now, NULL);
+      if(timeval_subtract(&tv_wait, &tv_until, &tv_now)) {
+        break;
+      }
+
+      if ((ret = select(sock + 1, &fds, NULL, NULL, &tv_wait)) == -1) {
+        logr("Error in pselect\n");
+        exit(1);
+      } else if (ret > 0) {
+        memset(&recv_buf, 0x0, sizeof(recv_buf));
+        remote_addr_len = sizeof(remote_addr);
+        ret = recvfrom(sock, &recv_buf, sizeof(recv_buf), 0, (struct sockaddr*)&remote_addr, &remote_addr_len);
+        if (ret < 0) {
+          if (errno == ECONNRESET) {
+            logr("%s ICMP unreach received\n", inet_ntoa(remote_addr.sin_addr));
+          } else {
+            logr("Error in recvfrom\n");
+          }
+        } else {
+          logr("%s ", inet_ntoa(remote_addr.sin_addr));
+          parse_snmp_response((u_char*)&recv_buf, ret);
+          if (o.print_ip) {
+            int quiet = o.quiet;
+            o.quiet = 0;
+            logr("%s\n", inet_ntoa(remote_addr.sin_addr));
+            o.quiet = quiet;
+          }
+          if (o.log) {
+            fflush(o.log_fd);
+          }
+        }
+      }
+    } while(1);
+  }
+
+  close(sock);
+  free(arg);
+  return NULL;
+}
+
+int main(int argc, char* argv[])
+{
+  int i;
+
+  init_options(argc, argv);
+  pthread_mutex_init(&log_mutex, NULL);
 
   if (!o.quiet) {
     logr("Scanning %d hosts, %d communities, %d jobs\n", host_count, community_count, o.jobs);
   }
 
-  pthread_t *senders = malloc(sizeof(pthread_t) * o.jobs);
+  pthread_t *scanners = malloc(sizeof(pthread_t) * o.jobs);
   int hosts_per_job = host_count / o.jobs;
   for (i = 0; i < o.jobs; i++) {
-    struct sender_job *job = malloc(sizeof(struct sender_job));
-    job->sock = sock;
+    struct scanner_job *job = malloc(sizeof(struct scanner_job));
     job->start = i * hosts_per_job;
     if (i == o.jobs - 1) {
       job->end = host_count;
     } else {
       job->end = (i + 1) * hosts_per_job;
     }
-    pthread_create(&senders[i], NULL, sender_worker, job);
+    pthread_create(&scanners[i], NULL, scanner_worker, job);
   }
 
   for (i = 0; i < o.jobs; i++) {
-    pthread_join(senders[i], NULL);
+    pthread_join(scanners[i], NULL);
   }
 
   if (o.debug > 0) {
-    logr("All packets sent, waiting for responses.\n");
+    logr("All jobs finished.\n");
   }
-
-  timed_receive(sock, 5000);
-
-  if (o.debug > 0) {
-    logr("done.\n");
-  }
-  free(senders);
+  free(scanners);
 
   if (o.log) fclose(o.log_fd);
 
