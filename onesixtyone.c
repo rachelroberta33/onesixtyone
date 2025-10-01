@@ -945,8 +945,7 @@ int main(int argc, char* argv[])
         if (!o.quiet) printf("Error in sendto: %s\n", strerror(errno));
         /* exit(1); */
       }
-
-      receive_snmp(sock, o.wait, &remote_addr);
+      usleep(o.wait * 1000);
     }
   }
 
