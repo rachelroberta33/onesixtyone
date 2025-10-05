@@ -9,7 +9,7 @@ mandir ?= $(datarootdir)/man
 man1dir ?= $(mandir)/man1
 
 onesixtyone: onesixtyone.c
-	$(CC) $(CFLAGS) $(LDFLAGS) $(CPPFLAGS) -o onesixtyone onesixtyone.c
+	$(CC) $(CFLAGS) $(LDFLAGS) $(CPPFLAGS) -o onesixtyone onesixtyone.c -pthread
 
 solaris: onesixtyone.c
 	cc -o onesixtyone onesixtyone.c -lsocket -lnsl
